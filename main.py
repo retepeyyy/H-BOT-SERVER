@@ -1,14 +1,15 @@
 # =====================================================================
-#  H-BOT Sunucu - Render icin guvenlikli versiyon
+#  H-BOT Sunucu - Honeypot (Tuzak) Sistemi Dahil
 #  ------------------------------------------------------------------
-#  - API Key ile korunur (X-API-Key header)
-#  - Kayit kapali (REGISTRATION_OPEN=false)
-#  - SQLite veritabani
-#  - JWT token
-#  - bcrypt sifreleme
+#  Ozellikler:
+#   - API Key korumasi
+#   - JWT auth + bcrypt
+#   - TUZAK kullanicilar (admin, root, test)
+#   - Email uyarisi (Gmail SMTP)
+#   - Sohbet yonetimi
 # =====================================================================
 
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
@@ -17,6 +18,9 @@ from pydantic import BaseModel
 import bcrypt
 import jwt
 import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -25,13 +29,20 @@ load_dotenv()
 # =====================================================================
 # AYARLAR
 # =====================================================================
-API_KEY = os.getenv("HBOT_API_KEY", "hbot-serve-1947sf9235v221")
-SECRET_KEY = os.getenv("SECRET_KEY", "1038D8636S9F686A9D49AGV6C9S4")
+API_KEY = os.getenv("HBOT_API_KEY", "hbot-ege-2026-gizli-anahtar-a7x9k2m5")
+SECRET_KEY = os.getenv("SECRET_KEY", "jwt-icin-uzun-bir-anahtar-degistir-bunu")
 REGISTRATION_OPEN = os.getenv("REGISTRATION_OPEN", "false").lower() == "true"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30  # 30 gun
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30
 
-# Render disk yok, SQLite kullan (veri kalici degil, uyku modunda silinir)
+# SMTP ayarlari
+SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+ALERT_SECRET = "hbot-alert-2026"  # Tuzak guvenlik anahtari
+
+# Tuzak kullanici adlari (biri bunlarla giris denerse email gelir)
+HONEYPOT_USERNAMES = ["admin", "root", "test", "honeypot", "superuser", "moderator"]
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./hbot_server.db")
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -67,6 +78,19 @@ class Message(Base):
     chat_id = Column(Integer, index=True, nullable=False)
     role = Column(String, nullable=False)
     content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AlertLog(Base):
+    """Tuzak tetiklendiginde log kaydi."""
+    __tablename__ = "alert_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    alert_type = Column(String, nullable=False)
+    username = Column(String)
+    password_attempt = Column(String)
+    ip_address = Column(String)
+    user_agent = Column(String)
+    details = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -111,7 +135,6 @@ def get_db():
 
 
 def verify_api_key(x_api_key: str = Header(...)):
-    """Her istekte X-API-Key header'i kontrol et."""
     if x_api_key != API_KEY:
         raise HTTPException(401, "Gecersiz API anahtari")
     return True
@@ -150,6 +173,93 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 
 
 # =====================================================================
+# EMAIL ALERT
+# =====================================================================
+def send_alert_email(subject: str, body: str) -> bool:
+    """Gmail SMTP ile uyari emaili gonder."""
+    if not SMTP_EMAIL or not SMTP_PASSWORD:
+        print("[ALERT] SMTP ayarlari eksik, email gonderilemedi", flush=True)
+        return False
+
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = SMTP_EMAIL
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as server:
+            server.starttls()
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.send_message(msg)
+
+        print(f"[ALERT] Email gonderildi: {subject}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[ALERT] Email hatasi: {e}", flush=True)
+        return False
+
+
+def trigger_honeypot_alert(
+    alert_type: str,
+    username: str,
+    password_attempt: str,
+    request: Request,
+    details: str = ""
+) -> None:
+    """Tuzak tetiklendiginde email gonder ve log kaydet."""
+    ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")[:200]
+
+    # Email icerigi
+    subject = f"🚨 H-BOT ALERT: {alert_type}"
+    body = f"""
+╔══════════════════════════════════════════╗
+║  🚨 H-BOT GUVENLIK UYARISI 🚨            ║
+╚══════════════════════════════════════════╝
+
+TUR: {alert_type}
+
+KULLANICI: {username}
+SIFRE DENEMESI: {password_attempt}
+IP ADRESI: {ip}
+USER-AGENT: {user_agent}
+ZAMAN: {datetime.now().isoformat()}
+
+DETAYLAR:
+{details}
+
+AKSIYON:
+1. Google Cloud Console'a git
+2. client_secret'i iptal et
+3. Yeni client_secret olustur
+4. .env dosyasini guncelle
+5. Render'i yeniden deploy et
+
+Bu email H-BOT honeypot sistemi tarafindan gonderildi.
+"""
+
+    send_alert_email(subject, body)
+
+    # Log kaydet
+    try:
+        db = SessionLocal()
+        log = AlertLog(
+            alert_type=alert_type,
+            username=username,
+            password_attempt=password_attempt,
+            ip_address=ip,
+            user_agent=user_agent,
+            details=details,
+        )
+        db.add(log)
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"[ALERT] Log kaydi hatasi: {e}", flush=True)
+
+
+# =====================================================================
 # APP
 # =====================================================================
 app = FastAPI(title="H-BOT Sunucu", version="1.0.0")
@@ -174,12 +284,17 @@ def health():
 
 
 # ---------------------------------------------------------------------
-# Kayit (API Key + REGISTRATION_OPEN kontrolu)
+# Kayit
 # ---------------------------------------------------------------------
 @app.post("/register")
 def register(user: UserCreate, db: Session = Depends(get_db), _: bool = Depends(verify_api_key)):
     if not REGISTRATION_OPEN:
         raise HTTPException(403, "Kayit su anda kapali")
+
+    # Tuzak: bu kullanici adlariyla kayit denemesi
+    if user.username.lower() in HONEYPOT_USERNAMES:
+        raise HTTPException(400, "Bu kullanici adi kullanilamaz")
+
     if db.query(User).filter(User.username == user.username).first():
         raise HTTPException(400, "Kullanici adi zaten var")
     if user.email and db.query(User).filter(User.email == user.email).first():
@@ -198,26 +313,59 @@ def register(user: UserCreate, db: Session = Depends(get_db), _: bool = Depends(
 
 
 # ---------------------------------------------------------------------
-# Giris (OAuth2 form + API Key)
+# Giris (OAuth2 form)
 # ---------------------------------------------------------------------
 @app.post("/token")
-def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login_form(
+    request: Request,
+    form: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    # TUZAK: Tuzak kullanici adi denemesi
+    if form.username.lower() in HONEYPOT_USERNAMES:
+        trigger_honeypot_alert(
+            alert_type="HONEYPOT_USERNAME_DENENDI",
+            username=form.username,
+            password_attempt=form.password,
+            request=request,
+            details="OAuth2 form uzerinden tuzak kullanici adi denendi.",
+        )
+        raise HTTPException(401, "Kullanici adi veya sifre yanlis")
+
     user = db.query(User).filter(User.username == form.username).first()
     if not user or not verify_password(form.password, user.hashed_password):
+        # Normal hatali giris - cok fazla olursa uyari
         raise HTTPException(401, "Kullanici adi veya sifre yanlis")
+
     token = create_access_token({"sub": user.username})
     return {"access_token": token, "token_type": "bearer"}
 
 
+# ---------------------------------------------------------------------
+# Giris (JSON)
+# ---------------------------------------------------------------------
 @app.post("/login")
 def login_json(
+    request: Request,
     data: UserLogin,
     db: Session = Depends(get_db),
     _: bool = Depends(verify_api_key),
 ):
+    # TUZAK: Tuzak kullanici adi denemesi
+    if data.username.lower() in HONEYPOT_USERNAMES:
+        trigger_honeypot_alert(
+            alert_type="HONEYPOT_USERNAME_DENENDI",
+            username=data.username,
+            password_attempt=data.password,
+            request=request,
+            details="JSON login uzerinden tuzak kullanici adi denendi.",
+        )
+        raise HTTPException(401, "Kullanici adi veya sifre yanlis")
+
     user = db.query(User).filter(User.username == data.username).first()
     if not user or not verify_password(data.password, user.hashed_password):
         raise HTTPException(401, "Kullanici adi veya sifre yanlis")
+
     token = create_access_token({"sub": user.username})
     return {
         "access_token": token,
@@ -353,7 +501,69 @@ def delete_chat(
 
 
 # ---------------------------------------------------------------------
-# Ilk kurulum icin: admin olustur (tek seferlik)
+# TUZAK: /alert/email endpoint
+# ---------------------------------------------------------------------
+class AlertRequest(BaseModel):
+    secret: str
+    message: str = "Tuzak tetiklendi"
+    details: str = ""
+
+
+@app.post("/alert/email")
+def alert_email(
+    request: Request,
+    data: AlertRequest,
+):
+    """Dis kaynaktan alert gonderme endpoint'i."""
+    if data.secret != ALERT_SECRET:
+        raise HTTPException(401, "Yetkisiz")
+
+    ip = request.client.host if request.client else "unknown"
+
+    subject = f"🚨 H-BOT ALERT: {data.message}"
+    body = f"""
+H-BOT TUZAK TETIKLENDI
+
+MESAJ: {data.message}
+DETAYLAR: {data.details}
+IP: {ip}
+ZAMAN: {datetime.now().isoformat()}
+
+AKSIYON:
+1. Google Cloud Console'a git
+2. client_secret'i iptal et
+3. Yeni client_secret olustur
+4. .env dosyasini guncelle
+"""
+
+    success = send_alert_email(subject, body)
+    return {"status": "ok" if success else "error", "email_sent": success}
+
+
+# ---------------------------------------------------------------------
+# TUZAK LOGLARI (sadece senin gorebilecegin)
+# ---------------------------------------------------------------------
+@app.get("/alert/logs")
+def alert_logs(
+    _: bool = Depends(verify_api_key),
+    db: Session = Depends(get_db),
+):
+    """Tuzak log kayitlarini listele. Sadece API key ile."""
+    logs = db.query(AlertLog).order_by(AlertLog.created_at.desc()).limit(100).all()
+    return [
+        {
+            "id": log.id,
+            "type": log.alert_type,
+            "username": log.username,
+            "ip": log.ip_address,
+            "created_at": log.created_at.isoformat(),
+        }
+        for log in logs
+    ]
+
+
+# ---------------------------------------------------------------------
+# Ilk kurulum icin: admin olustur
 # ---------------------------------------------------------------------
 @app.post("/setup-admin")
 def setup_admin(
@@ -361,11 +571,10 @@ def setup_admin(
     db: Session = Depends(get_db),
     _: bool = Depends(verify_api_key),
 ):
-    """Ilk kullanici olusturma. Sonra REGISTRATION_OPEN=false yap."""
     if db.query(User).count() > 0:
         raise HTTPException(400, "Sistemde zaten kullanici var")
-    if db.query(User).filter(User.username == user.username).first():
-        raise HTTPException(400, "Kullanici adi zaten var")
+    if user.username.lower() in HONEYPOT_USERNAMES:
+        raise HTTPException(400, "Bu kullanici adi kullanilamaz")
 
     new_user = User(
         username=user.username,
