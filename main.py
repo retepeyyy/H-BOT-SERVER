@@ -1,12 +1,8 @@
 # =====================================================================
-#  H-BOT Sunucu - Honeypot (Tuzak) Sistemi Dahil
+#  H-BOT Sunucu - Resend API + Honeypot (Tuzak) Sistemi
 #  ------------------------------------------------------------------
-#  Ozellikler:
-#   - API Key korumasi
-#   - JWT auth + bcrypt
-#   - TUZAK kullanicilar (admin, root, test)
-#   - Email uyarisi (Gmail SMTP)
-#   - Sohbet yonetimi
+#  Email: Resend API (Render SMTP'yi engelliyor)
+#  Honeypot: admin, root, test gibi kullanici adlari tuzak
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
@@ -18,9 +14,7 @@ from pydantic import BaseModel
 import bcrypt
 import jwt
 import os
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import requests as http_requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -35,12 +29,11 @@ REGISTRATION_OPEN = os.getenv("REGISTRATION_OPEN", "false").lower() == "true"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30
 
-# SMTP ayarlari
-SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-ALERT_SECRET = "hbot-alert-2026"  # Tuzak guvenlik anahtari
+# Resend API ayarlari (Render SMTP'yi engelledigi icin HTTP API kullaniyoruz)
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+ALERT_EMAIL = os.getenv("ALERT_EMAIL", "")
 
-# Tuzak kullanici adlari (biri bunlarla giris denerse email gelir)
+# Tuzak kullanici adlari
 HONEYPOT_USERNAMES = ["admin", "root", "test", "honeypot", "superuser", "moderator"]
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./hbot_server.db")
@@ -82,7 +75,6 @@ class Message(Base):
 
 
 class AlertLog(Base):
-    """Tuzak tetiklendiginde log kaydi."""
     __tablename__ = "alert_logs"
     id = Column(Integer, primary_key=True, index=True)
     alert_type = Column(String, nullable=False)
@@ -118,6 +110,12 @@ class ChatCreate(BaseModel):
 class MessageCreate(BaseModel):
     role: str
     content: str
+
+
+class AlertRequest(BaseModel):
+    secret: str
+    message: str = "Tuzak tetiklendi"
+    details: str = ""
 
 
 # =====================================================================
@@ -173,28 +171,39 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 
 
 # =====================================================================
-# EMAIL ALERT
+# EMAIL ALERT - RESEND API
 # =====================================================================
 def send_alert_email(subject: str, body: str) -> bool:
-    """Gmail SMTP ile uyari emaili gonder."""
-    if not SMTP_EMAIL or not SMTP_PASSWORD:
-        print("[ALERT] SMTP ayarlari eksik, email gonderilemedi", flush=True)
+    """Resend API ile email gonder."""
+    if not RESEND_API_KEY or not ALERT_EMAIL:
+        print("[ALERT] RESEND_API_KEY veya ALERT_EMAIL eksik", flush=True)
         return False
 
     try:
-        msg = MIMEMultipart()
-        msg["From"] = SMTP_EMAIL
-        msg["To"] = SMTP_EMAIL
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        response = http_requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": "H-BOT Alert <onboarding@resend.dev>",
+                "to": [ALERT_EMAIL],
+                "subject": subject,
+                "text": body,
+            },
+            timeout=15,
+        )
 
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as server:
-            server.starttls()
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            server.send_message(msg)
-
-        print(f"[ALERT] Email gonderildi: {subject}", flush=True)
-        return True
+        if response.status_code == 200:
+            print(f"[ALERT] Email gonderildi: {subject}", flush=True)
+            return True
+        else:
+            print(
+                f"[ALERT] Resend hatasi: {response.status_code} - {response.text[:200]}",
+                flush=True,
+            )
+            return False
     except Exception as e:
         print(f"[ALERT] Email hatasi: {e}", flush=True)
         return False
@@ -205,18 +214,17 @@ def trigger_honeypot_alert(
     username: str,
     password_attempt: str,
     request: Request,
-    details: str = ""
+    details: str = "",
 ) -> None:
     """Tuzak tetiklendiginde email gonder ve log kaydet."""
     ip = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent", "unknown")[:200]
 
-    # Email icerigi
     subject = f"🚨 H-BOT ALERT: {alert_type}"
     body = f"""
-╔══════════════════════════════════════════╗
-║  🚨 H-BOT GUVENLIK UYARISI 🚨            ║
-╚══════════════════════════════════════════╝
+========================================
+  🚨 H-BOT GUVENLIK UYARISI 🚨
+========================================
 
 TUR: {alert_type}
 
@@ -287,11 +295,14 @@ def health():
 # Kayit
 # ---------------------------------------------------------------------
 @app.post("/register")
-def register(user: UserCreate, db: Session = Depends(get_db), _: bool = Depends(verify_api_key)):
+def register(
+    user: UserCreate,
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_api_key),
+):
     if not REGISTRATION_OPEN:
         raise HTTPException(403, "Kayit su anda kapali")
 
-    # Tuzak: bu kullanici adlariyla kayit denemesi
     if user.username.lower() in HONEYPOT_USERNAMES:
         raise HTTPException(400, "Bu kullanici adi kullanilamaz")
 
@@ -321,7 +332,6 @@ def login_form(
     form: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
-    # TUZAK: Tuzak kullanici adi denemesi
     if form.username.lower() in HONEYPOT_USERNAMES:
         trigger_honeypot_alert(
             alert_type="HONEYPOT_USERNAME_DENENDI",
@@ -334,7 +344,6 @@ def login_form(
 
     user = db.query(User).filter(User.username == form.username).first()
     if not user or not verify_password(form.password, user.hashed_password):
-        # Normal hatali giris - cok fazla olursa uyari
         raise HTTPException(401, "Kullanici adi veya sifre yanlis")
 
     token = create_access_token({"sub": user.username})
@@ -351,7 +360,6 @@ def login_json(
     db: Session = Depends(get_db),
     _: bool = Depends(verify_api_key),
 ):
-    # TUZAK: Tuzak kullanici adi denemesi
     if data.username.lower() in HONEYPOT_USERNAMES:
         trigger_honeypot_alert(
             alert_type="HONEYPOT_USERNAME_DENENDI",
@@ -501,21 +509,11 @@ def delete_chat(
 
 
 # ---------------------------------------------------------------------
-# TUZAK: /alert/email endpoint
+# TUZAK: /alert/email
 # ---------------------------------------------------------------------
-class AlertRequest(BaseModel):
-    secret: str
-    message: str = "Tuzak tetiklendi"
-    details: str = ""
-
-
 @app.post("/alert/email")
-def alert_email(
-    request: Request,
-    data: AlertRequest,
-):
-    """Dis kaynaktan alert gonderme endpoint'i."""
-    if data.secret != ALERT_SECRET:
+def alert_email(request: Request, data: AlertRequest):
+    if data.secret != "hbot-alert-2026":
         raise HTTPException(401, "Yetkisiz")
 
     ip = request.client.host if request.client else "unknown"
@@ -533,7 +531,6 @@ AKSIYON:
 1. Google Cloud Console'a git
 2. client_secret'i iptal et
 3. Yeni client_secret olustur
-4. .env dosyasini guncelle
 """
 
     success = send_alert_email(subject, body)
@@ -541,14 +538,13 @@ AKSIYON:
 
 
 # ---------------------------------------------------------------------
-# TUZAK LOGLARI (sadece senin gorebilecegin)
+# TUZAK LOGLARI
 # ---------------------------------------------------------------------
 @app.get("/alert/logs")
 def alert_logs(
     _: bool = Depends(verify_api_key),
     db: Session = Depends(get_db),
 ):
-    """Tuzak log kayitlarini listele. Sadece API key ile."""
     logs = db.query(AlertLog).order_by(AlertLog.created_at.desc()).limit(100).all()
     return [
         {
