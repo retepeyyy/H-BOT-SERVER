@@ -1,8 +1,7 @@
 # =====================================================================
-#  H-BOT Sunucu - Resend API + Honeypot (Tuzak) Sistemi
+#  H-BOT Sunucu - SQLAdmin Görsel Admin Panel
 #  ------------------------------------------------------------------
-#  Email: Resend API (Render SMTP'yi engelliyor)
-#  Honeypot: admin, root, test gibi kullanici adlari tuzak
+#  Honeypot kaldirildi. Sadece admin panel + aktivite loglari.
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
@@ -11,10 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
+from sqladmin import Admin, ModelView
 import bcrypt
 import jwt
 import os
-import requests as http_requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -29,12 +29,9 @@ REGISTRATION_OPEN = os.getenv("REGISTRATION_OPEN", "false").lower() == "true"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30
 
-# Resend API ayarlari (Render SMTP'yi engelledigi icin HTTP API kullaniyoruz)
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-ALERT_EMAIL = os.getenv("ALERT_EMAIL", "")
-
-# Tuzak kullanici adlari
-HONEYPOT_USERNAMES = ["admin", "root", "test", "honeypot", "superuser", "moderator"]
+# Admin panel sifresi (SQLAdmin icin)
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "rt1886_admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Hb0t!Adm1n-2026#Ege")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./hbot_server.db")
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -74,15 +71,16 @@ class Message(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-class AlertLog(Base):
-    __tablename__ = "alert_logs"
+class ActivityLog(Base):
+    __tablename__ = "activity_logs"
     id = Column(Integer, primary_key=True, index=True)
-    alert_type = Column(String, nullable=False)
+    user_id = Column(Integer, index=True)
     username = Column(String)
-    password_attempt = Column(String)
+    action = Column(String)
+    details = Column(Text)
     ip_address = Column(String)
     user_agent = Column(String)
-    details = Column(Text)
+    success = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -110,12 +108,6 @@ class ChatCreate(BaseModel):
 class MessageCreate(BaseModel):
     role: str
     content: str
-
-
-class AlertRequest(BaseModel):
-    secret: str
-    message: str = "Tuzak tetiklendi"
-    details: str = ""
 
 
 # =====================================================================
@@ -170,107 +162,47 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 
-# =====================================================================
-# EMAIL ALERT - RESEND API
-# =====================================================================
-def send_alert_email(subject: str, body: str) -> bool:
-    """Resend API ile email gonder."""
-    if not RESEND_API_KEY or not ALERT_EMAIL:
-        print("[ALERT] RESEND_API_KEY veya ALERT_EMAIL eksik", flush=True)
-        return False
-
-    try:
-        response = http_requests.post(
-            "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {RESEND_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "from": "H-BOT Alert <onboarding@resend.dev>",
-                "to": [ALERT_EMAIL],
-                "subject": subject,
-                "text": body,
-            },
-            timeout=15,
-        )
-
-        if response.status_code == 200:
-            print(f"[ALERT] Email gonderildi: {subject}", flush=True)
-            return True
-        else:
-            print(
-                f"[ALERT] Resend hatasi: {response.status_code} - {response.text[:200]}",
-                flush=True,
-            )
-            return False
-    except Exception as e:
-        print(f"[ALERT] Email hatasi: {e}", flush=True)
-        return False
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
-def trigger_honeypot_alert(
-    alert_type: str,
+def log_activity(
+    db: Session,
+    user_id: int,
     username: str,
-    password_attempt: str,
+    action: str,
+    details: str,
     request: Request,
-    details: str = "",
-) -> None:
-    """Tuzak tetiklendiginde email gonder ve log kaydet."""
-    ip = request.client.host if request.client else "unknown"
-    user_agent = request.headers.get("user-agent", "unknown")[:200]
-
-    subject = f"🚨 H-BOT ALERT: {alert_type}"
-    body = f"""
-========================================
-  🚨 H-BOT GUVENLIK UYARISI 🚨
-========================================
-
-TUR: {alert_type}
-
-KULLANICI: {username}
-SIFRE DENEMESI: {password_attempt}
-IP ADRESI: {ip}
-USER-AGENT: {user_agent}
-ZAMAN: {datetime.now().isoformat()}
-
-DETAYLAR:
-{details}
-
-AKSIYON:
-1. Google Cloud Console'a git
-2. client_secret'i iptal et
-3. Yeni client_secret olustur
-4. .env dosyasini guncelle
-5. Render'i yeniden deploy et
-
-Bu email H-BOT honeypot sistemi tarafindan gonderildi.
-"""
-
-    send_alert_email(subject, body)
-
-    # Log kaydet
+    success: bool = True,
+):
     try:
-        db = SessionLocal()
-        log = AlertLog(
-            alert_type=alert_type,
+        ip = get_client_ip(request)
+        user_agent = request.headers.get("user-agent", "")[:200]
+
+        log = ActivityLog(
+            user_id=user_id,
             username=username,
-            password_attempt=password_attempt,
+            action=action,
+            details=details,
             ip_address=ip,
             user_agent=user_agent,
-            details=details,
+            success="true" if success else "false",
         )
         db.add(log)
         db.commit()
-        db.close()
     except Exception as e:
-        print(f"[ALERT] Log kaydi hatasi: {e}", flush=True)
+        print(f"[ACTIVITY] Log kaydi hatasi: {e}", flush=True)
 
 
 # =====================================================================
 # APP
 # =====================================================================
 app = FastAPI(title="H-BOT Sunucu", version="1.0.0")
+
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
 
 app.add_middleware(
     CORSMiddleware,
@@ -296,15 +228,13 @@ def health():
 # ---------------------------------------------------------------------
 @app.post("/register")
 def register(
+    request: Request,
     user: UserCreate,
     db: Session = Depends(get_db),
     _: bool = Depends(verify_api_key),
 ):
     if not REGISTRATION_OPEN:
         raise HTTPException(403, "Kayit su anda kapali")
-
-    if user.username.lower() in HONEYPOT_USERNAMES:
-        raise HTTPException(400, "Bu kullanici adi kullanilamaz")
 
     if db.query(User).filter(User.username == user.username).first():
         raise HTTPException(400, "Kullanici adi zaten var")
@@ -320,6 +250,13 @@ def register(
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
+
+    log_activity(
+        db, new_user.id, user.username, "register",
+        f"Yeni kullanici kaydi: {user.username}",
+        request, success=True
+    )
+
     return {"message": "Kayit basarili", "user_id": new_user.id}
 
 
@@ -332,19 +269,20 @@ def login_form(
     form: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
-    if form.username.lower() in HONEYPOT_USERNAMES:
-        trigger_honeypot_alert(
-            alert_type="HONEYPOT_USERNAME_DENENDI",
-            username=form.username,
-            password_attempt=form.password,
-            request=request,
-            details="OAuth2 form uzerinden tuzak kullanici adi denendi.",
+    user = db.query(User).filter(User.username == form.username).first()
+    if not user or not verify_password(form.password, user.hashed_password):
+        log_activity(
+            db, user.id if user else 0, form.username, "login_failed",
+            "Basarisiz giris denemesi",
+            request, success=False
         )
         raise HTTPException(401, "Kullanici adi veya sifre yanlis")
 
-    user = db.query(User).filter(User.username == form.username).first()
-    if not user or not verify_password(form.password, user.hashed_password):
-        raise HTTPException(401, "Kullanici adi veya sifre yanlis")
+    log_activity(
+        db, user.id, user.username, "login",
+        "Basarili giris",
+        request, success=True
+    )
 
     token = create_access_token({"sub": user.username})
     return {"access_token": token, "token_type": "bearer"}
@@ -360,19 +298,20 @@ def login_json(
     db: Session = Depends(get_db),
     _: bool = Depends(verify_api_key),
 ):
-    if data.username.lower() in HONEYPOT_USERNAMES:
-        trigger_honeypot_alert(
-            alert_type="HONEYPOT_USERNAME_DENENDI",
-            username=data.username,
-            password_attempt=data.password,
-            request=request,
-            details="JSON login uzerinden tuzak kullanici adi denendi.",
+    user = db.query(User).filter(User.username == data.username).first()
+    if not user or not verify_password(data.password, user.hashed_password):
+        log_activity(
+            db, user.id if user else 0, data.username, "login_failed",
+            "Basarisiz giris denemesi",
+            request, success=False
         )
         raise HTTPException(401, "Kullanici adi veya sifre yanlis")
 
-    user = db.query(User).filter(User.username == data.username).first()
-    if not user or not verify_password(data.password, user.hashed_password):
-        raise HTTPException(401, "Kullanici adi veya sifre yanlis")
+    log_activity(
+        db, user.id, user.username, "login",
+        "Basarili giris",
+        request, success=True
+    )
 
     token = create_access_token({"sub": user.username})
     return {
@@ -423,6 +362,7 @@ def list_chats(
 
 @app.post("/chats")
 def create_chat(
+    request: Request,
     data: ChatCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -432,6 +372,13 @@ def create_chat(
     db.add(chat)
     db.commit()
     db.refresh(chat)
+
+    log_activity(
+        db, current_user.id, current_user.username, "chat_create",
+        f"Yeni sohbet: {data.title}",
+        request, success=True
+    )
+
     return {"id": chat.id, "title": chat.title}
 
 
@@ -467,6 +414,7 @@ def get_messages(
 
 @app.post("/chats/{chat_id}/messages")
 def add_message(
+    request: Request,
     chat_id: int,
     data: MessageCreate,
     current_user: User = Depends(get_current_user),
@@ -485,6 +433,13 @@ def add_message(
     chat.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(msg)
+
+    log_activity(
+        db, current_user.id, current_user.username, "message",
+        f"Sohbet #{chat_id}: {data.role}",
+        request, success=True
+    )
+
     return {"id": msg.id, "message": "Kaydedildi"}
 
 
@@ -509,56 +464,6 @@ def delete_chat(
 
 
 # ---------------------------------------------------------------------
-# TUZAK: /alert/email
-# ---------------------------------------------------------------------
-@app.post("/alert/email")
-def alert_email(request: Request, data: AlertRequest):
-    if data.secret != "hbot-alert-2026":
-        raise HTTPException(401, "Yetkisiz")
-
-    ip = request.client.host if request.client else "unknown"
-
-    subject = f"🚨 H-BOT ALERT: {data.message}"
-    body = f"""
-H-BOT TUZAK TETIKLENDI
-
-MESAJ: {data.message}
-DETAYLAR: {data.details}
-IP: {ip}
-ZAMAN: {datetime.now().isoformat()}
-
-AKSIYON:
-1. Google Cloud Console'a git
-2. client_secret'i iptal et
-3. Yeni client_secret olustur
-"""
-
-    success = send_alert_email(subject, body)
-    return {"status": "ok" if success else "error", "email_sent": success}
-
-
-# ---------------------------------------------------------------------
-# TUZAK LOGLARI
-# ---------------------------------------------------------------------
-@app.get("/alert/logs")
-def alert_logs(
-    _: bool = Depends(verify_api_key),
-    db: Session = Depends(get_db),
-):
-    logs = db.query(AlertLog).order_by(AlertLog.created_at.desc()).limit(100).all()
-    return [
-        {
-            "id": log.id,
-            "type": log.alert_type,
-            "username": log.username,
-            "ip": log.ip_address,
-            "created_at": log.created_at.isoformat(),
-        }
-        for log in logs
-    ]
-
-
-# ---------------------------------------------------------------------
 # Ilk kurulum icin: admin olustur
 # ---------------------------------------------------------------------
 @app.post("/setup-admin")
@@ -569,8 +474,6 @@ def setup_admin(
 ):
     if db.query(User).count() > 0:
         raise HTTPException(400, "Sistemde zaten kullanici var")
-    if user.username.lower() in HONEYPOT_USERNAMES:
-        raise HTTPException(400, "Bu kullanici adi kullanilamaz")
 
     new_user = User(
         username=user.username,
@@ -582,6 +485,108 @@ def setup_admin(
     db.commit()
     db.refresh(new_user)
     return {"message": "Admin olusturuldu", "user_id": new_user.id}
+
+
+# =====================================================================
+# SQLADMIN - Görsel Admin Panel
+# =====================================================================
+class UserAdmin(ModelView, model=User):
+    name = "Kullanici"
+    name_plural = "Kullanicilar"
+    icon = "fa-solid fa-user"
+    column_list = [User.id, User.username, User.email, User.display_name, User.created_at]
+    column_searchable_list = [User.username, User.email]
+    column_sortable_list = [User.id, User.username, User.created_at]
+    can_create = False
+    can_delete = True
+    can_edit = True
+
+
+class ChatAdmin(ModelView, model=Chat):
+    name = "Sohbet"
+    name_plural = "Sohbetler"
+    icon = "fa-solid fa-comments"
+    column_list = [Chat.id, Chat.user_id, Chat.title, Chat.created_at, Chat.updated_at]
+    column_searchable_list = [Chat.title]
+    column_sortable_list = [Chat.id, Chat.user_id, Chat.updated_at]
+    can_create = False
+    can_delete = True
+
+
+class MessageAdmin(ModelView, model=Message):
+    name = "Mesaj"
+    name_plural = "Mesajlar"
+    icon = "fa-solid fa-envelope"
+    column_list = [Message.id, Message.chat_id, Message.role, Message.created_at]
+    column_searchable_list = [Message.content]
+    column_sortable_list = [Message.id, Message.created_at]
+    can_create = False
+    can_delete = True
+
+
+class ActivityLogAdmin(ModelView, model=ActivityLog):
+    name = "Aktivite"
+    name_plural = "Aktiviteler"
+    icon = "fa-solid fa-list"
+    column_list = [ActivityLog.id, ActivityLog.username, ActivityLog.action, ActivityLog.ip_address, ActivityLog.success, ActivityLog.created_at]
+    column_searchable_list = [ActivityLog.username, ActivityLog.action]
+    column_sortable_list = [ActivityLog.id, ActivityLog.created_at]
+    can_create = False
+    can_edit = False
+    can_delete = True
+
+
+admin = Admin(
+    app,
+    engine,
+    name="H-BOT Admin",
+    base_url="/admin",
+    title="H-BOT Yonetim Paneli",
+)
+
+admin.add_view(UserAdmin)
+admin.add_view(ChatAdmin)
+admin.add_view(MessageAdmin)
+admin.add_view(ActivityLogAdmin)
+
+
+# =====================================================================
+# ADMIN AUTH MIDDLEWARE
+# =====================================================================
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
+import base64
+
+
+class AdminAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path.startswith("/admin"):
+            auth = request.headers.get("authorization", "")
+            if not auth.startswith("Basic "):
+                return Response(
+                    "Unauthorized",
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Basic"},
+                )
+            try:
+                decoded = base64.b64decode(auth[6:]).decode("utf-8")
+                username, password = decoded.split(":", 1)
+                if username != ADMIN_USERNAME or password != ADMIN_PASSWORD:
+                    return Response(
+                        "Unauthorized",
+                        status_code=401,
+                        headers={"WWW-Authenticate": "Basic"},
+                    )
+            except Exception:
+                return Response(
+                    "Unauthorized",
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Basic"},
+                )
+        return await call_next(request)
+
+
+app.add_middleware(AdminAuthMiddleware)
 
 
 if __name__ == "__main__":
