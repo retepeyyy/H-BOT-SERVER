@@ -6,3 +6,5 @@ pyjwt
 python-dotenv
 python-multipart
 requests
+sqladmin
+itsdangerous
