@@ -5,6 +5,6 @@ bcrypt
 pyjwt
 python-dotenv
 python-multipart
-requests
 sqladmin
 itsdangerous
+jinja2
