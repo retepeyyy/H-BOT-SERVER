@@ -546,7 +546,6 @@ class ActivityLogAdmin(ModelView, model=ActivityLog):
 admin = Admin(
     app,
     engine,
-    name="H-BOT Admin",
     base_url="/admin",
     title="H-BOT Yonetim Paneli",
 )
