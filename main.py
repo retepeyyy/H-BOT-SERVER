@@ -1,7 +1,11 @@
 # =====================================================================
 #  H-BOT Sunucu - SQLAdmin Görsel Admin Panel
 #  ------------------------------------------------------------------
-#  Honeypot kaldirildi. Sadece admin panel + aktivite loglari.
+#  Özellikler:
+#   - API Key korumasi
+#   - JWT auth + bcrypt
+#   - Görsel admin panel (/admin)
+#   - Kullanici/sohbet/mesaj/aktivite yönetimi
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
@@ -11,10 +15,13 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 from sqladmin import Admin, ModelView
 import bcrypt
 import jwt
 import os
+import base64
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -553,11 +560,6 @@ admin.add_view(ActivityLogAdmin)
 # =====================================================================
 # ADMIN AUTH MIDDLEWARE
 # =====================================================================
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
-import base64
-
-
 class AdminAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.url.path.startswith("/admin"):
