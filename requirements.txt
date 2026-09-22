@@ -8,3 +8,4 @@ python-multipart
 sqladmin
 itsdangerous
 jinja2
+psycopg2-binary
